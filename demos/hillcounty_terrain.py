@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from foci.visualisation.vis_utils import ViserVis
-from foci.utils.ply import extract_splat_data
+from foci.utils.ply import extract_splat_data, filter_floaters
 from foci.utils.terrain import build_height_map, query_height
 from foci.planners.planner_terrain import TerrainPlanner
 
@@ -11,13 +11,12 @@ LOCAL = os.path.dirname(os.path.abspath(__file__))
 ply_file = os.path.join(LOCAL, 'data/hillcounty_sm_30000.ply')
 
 means, covs, colors, opacities = extract_splat_data(ply_file)
-
-# opacity_threshold = 0.5
-# opacity_mask = opacities[:, 0] > opacity_threshold
-# means = means[opacity_mask]
-# covs = covs[opacity_mask]
-# colors = colors[opacity_mask]
-# opacities = opacities[opacity_mask]
+means, covs, colors, opacities = filter_floaters(
+    means, covs, colors, opacities,
+    opacity_threshold=0.3,   # more lenient than 0.5 since density also filters
+    density_radius=0.05,     # in raw (pre-scale) units — tune this first
+    min_neighbors=5
+)
 
 # Normalize Z and scale
 ground_z = np.percentile(means[:, 2], 6)

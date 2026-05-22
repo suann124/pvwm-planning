@@ -32,7 +32,7 @@ class TerrainPlanner():
         pose = cas.MX.sym("pose", 4) # Casadi symbolic variable for pose, set 4dof
         theta = pose[3] # yaw angle
         middle = pose[:3]
-        scale = 0.05 
+        scale = 0.1 
         left = middle - cas.vertcat(cas.cos(theta)* scale, cas.sin(theta) * scale, 0)
         right = middle + cas.vertcat(cas.cos(theta) *scale, cas.sin(theta) * scale, 0)
 
@@ -68,7 +68,7 @@ class TerrainPlanner():
         for i in range(1, self.num_samples):
             astar_length += np.linalg.norm(spline[i,:3] - spline[i-1,:3]) #approximate the length of the spline
         
-        self.ubg[-1] = astar_length * 1.0 #set the upper bound of the spline length
+        self.ubg[-1] = astar_length * 1.5 #set the upper bound of the spline length
 
         #solve the optimization problem
         res = self.solver(x0 = init_guess, lbg = self.lbg, ubg = self.ubg, p = np.concatenate((start_pos, end_pos)))

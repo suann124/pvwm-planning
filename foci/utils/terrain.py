@@ -53,6 +53,41 @@ def build_height_map(ground_pts, cell_size=0.5):
     return height_map, x_min, y_min, cell_size
 
 
+def build_flood_obstacle_mask(flood_means, height_map, x_min, y_min, cell_size,
+                               wading_depth=0.0):
+    """Mark occupancy-grid cells as impassable where flood water exceeds wading depth.
+
+    Water depth at each flood Gaussian is computed as its Z minus the local
+    terrain height from the height map.  A cell is marked flooded when at least
+    one flood Gaussian has depth > wading_depth.  Combine the returned mask with
+    the terrain obstacle mask via logical OR before passing to the planner.
+
+    Args:
+        flood_means:  (N, 3) flood Gaussian centres in scaled terrain coords
+        height_map:   (nx, ny) terrain height map from build_height_map
+        x_min, y_min: grid origin from build_height_map
+        cell_size:    grid resolution from build_height_map
+        wading_depth: water depth (scaled units) the robot can wade through.
+                      0.0 = any standing water is impassable; increase to allow
+                      shallow crossings.
+
+    Returns:
+        flood_mask: (nx, ny) bool array — True where the cell is flooded
+    """
+    nx, ny = height_map.shape
+    flood_mask = np.zeros((nx, ny), dtype=bool)
+
+    xi = np.clip(((flood_means[:, 0] - x_min) / cell_size).astype(int), 0, nx - 1)
+    yi = np.clip(((flood_means[:, 1] - y_min) / cell_size).astype(int), 0, ny - 1)
+
+    local_terrain_z = height_map[xi, yi]
+    depth = flood_means[:, 2] - local_terrain_z
+    deep = depth > wading_depth
+
+    flood_mask[xi[deep], yi[deep]] = True
+    return flood_mask
+
+
 def query_height(height_map, x_min, y_min, cell_size, x, y, default=0.0):
     """Look up terrain height at position (x, y) using bilinear interpolation.
 
