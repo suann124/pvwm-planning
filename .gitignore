@@ -178,3 +178,6 @@ cython_debug/
 
 # Ignore extracted data files
 demos/data/*
+
+# Ignore generated images
+*.png
