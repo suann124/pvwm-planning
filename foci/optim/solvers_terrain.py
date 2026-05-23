@@ -12,19 +12,25 @@ from foci.splines.bsplines import  spline_eval, get_minvo_hulls
 from foci.convolution.gaussian_robot_warp import ConvolutionFunctorWarp
 
 def create_solver(num_control_points,
-                obstacle_means, 
-                covs_det, 
-                covs_inv, 
-                kinematics,  
+                obstacle_means,
+                covs_det,
+                covs_inv,
+                kinematics,
                 dim_control_points=3,
                 dim_rotation = 1,
-                num_samples=30, 
-                num_body_parts = 1, 
-                x_range = None, 
-                y_range = None, 
+                num_samples=30,
+                num_body_parts = 1,
+                x_range = None,
+                y_range = None,
                 z_range = None,
-                vmax = 1, 
-                amax = 1):
+                vmax = 1,
+                amax = 1,
+                height_map=None,
+                hm_x_min=0.0,
+                hm_y_min=0.0,
+                hm_cell=1.0,
+                clearance=0.0,
+                z_band=0.3):
     """ Return casadi solver object and upper and lower bounds for the optimization problem
     @args:
         num_control_points: int
@@ -71,7 +77,7 @@ def create_solver(num_control_points,
     w_0 = 0.1 # jerk cost
     w_1 = 100 # obstacle cost
     w_2 = 100 # goal cost
-    w_head = 1
+    w_head = 10
     
     # define helpful mappings
     curve = spline_eval(control_points, num_samples)
@@ -138,7 +144,27 @@ def create_solver(num_control_points,
                 lbg = np.concatenate((lbg, [z_range[0]]))
                 ubg = np.concatenate((ubg, [z_range[1]]))
 
-            
+    # Per-sample terrain-following Z constraint ============
+    # Without this the NLP Z is free and the path can "fly" above the water
+    # surface, where the column-fill obstacle Gaussians (which end at
+    # water_surface) exert effectively zero cost.  Constraining each sample
+    # to [terrain_z + clearance, terrain_z + clearance + z_band] keeps the
+    # path inside the flood column so the obstacle cost is correctly felt.
+    if height_map is not None:
+        nx, ny = height_map.shape
+        x_knots = hm_x_min + np.arange(nx) * hm_cell
+        y_knots = hm_y_min + np.arange(ny) * hm_cell
+        # CasADi interpolant: values[ix + iy*nx] = height_map[ix, iy]
+        # height_map.flatten('F') is column-major, giving exactly that layout.
+        terrain_lut = cas.interpolant('terrain_lut', 'linear',
+                                      [x_knots, y_knots],
+                                      height_map.flatten('F'))
+        for i in range(curve.shape[0]):
+            tz = terrain_lut(cas.vertcat(curve[i, 0], curve[i, 1]))
+            cons = cas.vertcat(cons, curve[i, 2] - tz)
+            lbg = np.concatenate((lbg, [clearance]))
+            ubg = np.concatenate((ubg, [clearance + z_band]))
+
     # velocity constraints =================================
     # for i in range(curve.shape[0]):
     #     cons = cas.vertcat(cons, dcurve[i,0] ** 2 + dcurve[i,1] ** 2 + dcurve[i,2] ** 2)

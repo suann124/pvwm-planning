@@ -17,7 +17,8 @@ import matplotlib.pyplot as plt
 
 from foci.visualisation.vis_utils import ViserVis
 from foci.utils.ply import extract_splat_data, filter_floaters, load_flood_data
-from foci.utils.terrain import build_height_map, query_height
+from foci.utils.terrain import (build_height_map, query_height, build_flood_navigation,
+                                build_flood_obstacles, build_pin_surface)
 from foci.planners.planner_terrain import TerrainPlanner
 
 LOCAL = os.path.dirname(os.path.abspath(__file__))
@@ -25,8 +26,8 @@ LOCAL = os.path.dirname(os.path.abspath(__file__))
 FLOOD_LEVEL = sys.argv[1] if len(sys.argv) > 1 else 'medium'
 assert FLOOD_LEVEL in ('low', 'medium', 'high'), "level must be low / medium / high"
 
-TERRAIN_PLY = os.path.join(LOCAL, 'data/hillcounty_sm_30000.ply')
-FLOOD_PLY   = os.path.join(LOCAL, f'data/hillcountry_flood_{FLOOD_LEVEL}.ply')
+TERRAIN_PLY = os.path.join(LOCAL, 'data/hillcounty_30000_new.ply')
+FLOOD_PLY   = os.path.join(LOCAL, f'data/hillcountry_flood_{FLOOD_LEVEL}_ravine.ply')
 
 # ── 1. Terrain (identical pipeline to hillcounty_terrain.py) ─────────────────
 print("Loading terrain...")
@@ -53,8 +54,8 @@ print(f"  Z: {means[:,2].min():.1f} .. {means[:,2].max():.1f}")
 
 colors = np.clip(colors, 0.0, 1.0)   # SH-derived colors can exceed [0,1]
 
-start_xy = [11.0, -18.0]
-end_xy   = [20.0,  10.0]
+start_xy = [-30.0, -18.0]
+end_xy   = [-20.0,  10.0]
 
 z_var = covs[:, 2, 2]
 flat_threshold = np.percentile(z_var, 30)
@@ -74,13 +75,11 @@ print(f"Height map: {height_map.shape}")
 #                   flies above the top of the obstacle voxels and never starts
 #                   inside one.  (voxel_size = 0.25 → need clearance > ~0.6)
 obs_threshold = 0.3   # scaled units
-clearance     = 1   # scaled units (navigates ~50 cm above terrain, ~25 cm above tallest obs voxel top)
-
-start_z_terrain = query_height(height_map, hm_x_min, hm_y_min, hm_cell, start_xy[0], start_xy[1])
-end_z_terrain   = query_height(height_map, hm_x_min, hm_y_min, hm_cell, end_xy[0],   end_xy[1])
-nav_z = 0.5 * (start_z_terrain + end_z_terrain) + clearance
-print(f"Terrain Z  — start: {start_z_terrain:.3f}, end: {end_z_terrain:.3f}")
-print(f"obs_threshold: {obs_threshold}, clearance: {clearance}, nav_z: {nav_z:.3f}")
+clearance     = 0.2     # scaled units: robot navigates this far above the navigable surface
+wading_depth  = 0   # scaled units: water shallower than this is wadeable (ride on top);
+                      # deeper water is impassable and routed around.
+# NB: start/end navigation Z are computed AFTER the navigable surface is built
+# (below), so endpoints sit above any water there too.
 
 # ── 2. Load flood data and build flood obstacle mask ─────────────────────────
 print(f"\nLoading flood PLY: {FLOOD_LEVEL}...")
@@ -91,50 +90,34 @@ print(f"Flood {FLOOD_LEVEL} (scaled): "
       f"Z={flood_means[:,2].min():.1f}..{flood_means[:,2].max():.1f}  "
       f"n={len(flood_means)}")
 
-# ── 2b. Build flood surface map + dense flood obstacle carpet ─────────────────
-# Map each flood Gaussian into the terrain grid.
-fxi = np.clip(((flood_means[:, 0] - hm_x_min) / hm_cell).astype(int), 0, height_map.shape[0] - 1)
-fyi = np.clip(((flood_means[:, 1] - hm_y_min) / hm_cell).astype(int), 0, height_map.shape[1] - 1)
+# ── 2b. Navigable surface + impassable mask ───────────────────────────────────
+# Combine dry terrain with the flood: ride on top of wadeable water, route around
+# water deeper than `wading_depth`.  `nav_surface` (not the dry height map) now
+# drives the A* Z-band, the endpoint heights and the final Z-pinning, so the path
+# can never sit beneath the water surface.
+nav_surface, impassable, water_surface = build_flood_navigation(
+    height_map, flood_means, hm_x_min, hm_y_min, hm_cell,
+    wading_depth=wading_depth,
+)
+print(f"Flooded cells: {(~np.isnan(water_surface)).sum()}, "
+      f"impassable (deep) cells: {int(impassable.sum())}")
 
-# flood_surface[i, j] = max flood Z seen in that cell
-flood_surface = np.full(height_map.shape, -np.inf)
-np.maximum.at(flood_surface, (fxi, fyi), flood_means[:, 2])
-flood_surface[flood_surface == -np.inf] = np.nan
+# Start/end navigation Z from the navigable surface (above any water there too).
+start_z = query_height(nav_surface, hm_x_min, hm_y_min, hm_cell, start_xy[0], start_xy[1]) + clearance
+end_z   = query_height(nav_surface, hm_x_min, hm_y_min, hm_cell, end_xy[0],   end_xy[1])   + clearance
+print(f"Nav Z — start: {start_z:.3f}, end: {end_z:.3f}")
 
-# Flooded cells = water sitting meaningfully above terrain
-flood_depth = flood_surface - height_map
-flood_mask = (~np.isnan(flood_surface)) & (flood_depth > 0.02)   # tune threshold
+# Flood obstacle Gaussians filling the water COLUMN over each impassable cell, so
+# the convolution cost penalises the robot at any height inside the water (not just
+# a thin surface disk it can slip under). A* also refuses these cells via the mask;
+# this makes the NLP itself flood-aware, pushing the optimized curve out laterally.
+flood_means_nav, flood_covs_nav = build_flood_obstacles(
+    impassable, water_surface, height_map, hm_x_min, hm_y_min, hm_cell,
+)
+print(f"Flood deep-water obstacle Gaussians (column-filled): {len(flood_means_nav)}")
 
-print(f"Flood cells in grid: {flood_mask.sum()}")
-
-# Build one obstacle Gaussian per flooded grid cell.
-flood_cells = np.argwhere(flood_mask)   # rows are [ix, iy]
-
-flood_means_nav = np.zeros((len(flood_cells), 3), dtype=float)
-flood_covs_nav = np.zeros((len(flood_cells), 3, 3), dtype=float)
-
-for k, (ix, iy) in enumerate(flood_cells):
-    # Cell center in world coordinates
-    x = hm_x_min + (ix + 0.5) * hm_cell
-    y = hm_y_min + (iy + 0.5) * hm_cell
-
-    # Put flood obstacle at the ground robot navigation plane
-    z = height_map[ix, iy] + clearance
-
-    flood_means_nav[k] = [x, y, z]
-
-    # Dense lateral footprint so neighboring cells overlap and form a carpet.
-    # Tune these if needed.
-    sigma_xy = 0.75 * hm_cell
-    sigma_z  = 0.05
-
-    flood_covs_nav[k] = np.diag([
-        sigma_xy**2,
-        sigma_xy**2,
-        sigma_z**2,
-    ])
-
-print(f"Flood Gaussians kept as nav-obstacles: {len(flood_means_nav)}")
+# Pin surface for the final Z snap: ride on top of any water, never under it.
+pin_surface = build_pin_surface(height_map, water_surface)
 
 # ── 3. Build obstacle mask ────────────────────────────────────────────────────
 
@@ -214,27 +197,36 @@ plt.close()
 # ── 5. Plan ───────────────────────────────────────────────────────────────────
 robot_cov = np.eye(3) * 0.0001
 planner = TerrainPlanner(obstacle_means, obstacle_covs, robot_cov,
-                         num_control_points=10, num_samples=50, z_range=z_range)
+                         num_control_points=10, num_samples=200, z_range=z_range,
+                         height_map=height_map,
+                         hm_x_min=hm_x_min,
+                         hm_y_min=hm_y_min,
+                         hm_cell=hm_cell,
+                         clearance=clearance,
+                         z_band=0.15)
 
-start = [start_xy[0], start_xy[1], start_z_terrain + clearance, np.pi/2]
-end   = [end_xy[0],   end_xy[1],   end_z_terrain   + clearance, np.pi/2]
+start = [start_xy[0], start_xy[1], start_z, np.pi/2]
+end   = [end_xy[0],   end_xy[1],   end_z,   np.pi/2]
 
 
 opt_curve, astar = planner.plan(
     start, end,
-    height_map=height_map,
+    height_map=nav_surface,          # navigable surface, not dry terrain
     hm_x_min=hm_x_min,
     hm_y_min=hm_y_min,
     hm_cell=hm_cell,
     clearance=clearance,
-    z_band=0.15,   # robot navigates within 15 cm band above local terrain
+    z_band=0.15,   # robot navigates within 15 cm band above the navigable surface
+    impassable_mask=impassable,      # deep water -> route around
 )
 
 print(f"A* path points: {len(astar)}")
 
 for i in range(len(opt_curve)):
     x, y = opt_curve[i, 0], opt_curve[i, 1]
-    opt_curve[i, 2] = query_height(height_map, hm_x_min, hm_y_min, hm_cell, x, y) + clearance
+    # Pin to the flood ceiling (max of terrain and water) so the path rides on top
+    # of any water it strays over — never snapped down onto the dry ravine floor.
+    opt_curve[i, 2] = query_height(pin_surface, hm_x_min, hm_y_min, hm_cell, x, y) + clearance
 
 # ── 6. Visualise ──────────────────────────────────────────────────────────────
 margin = 30

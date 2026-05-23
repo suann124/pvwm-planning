@@ -19,7 +19,7 @@ def linear_interpolation(start_point, end_point, n_control_points):
 class BasicAStar(AStar):
     def __init__(self, bounds, occ_map, step_size=1.0,
                  height_map=None, hm_x_min=0.0, hm_y_min=0.0, hm_cell=1.0,
-                 clearance=0.0, z_band=0.2):
+                 clearance=0.0, z_band=0.2, impassable_mask=None):
         self.bounds = bounds
         self.occ_map = occ_map
         self.step_size = step_size
@@ -32,6 +32,19 @@ class BasicAStar(AStar):
         self.hm_cell = hm_cell
         self.clearance = clearance
         self.z_band = z_band
+        # Optional (nx, ny) bool grid (same frame as height_map) marking cells the
+        # robot cannot enter — e.g. flood water deeper than the wading depth. The
+        # search refuses to expand into these cells, so it routes around them.
+        self.impassable_mask = impassable_mask
+
+    def _is_impassable(self, x, y):
+        """True if world (x, y) lands in a cell flagged impassable."""
+        if self.impassable_mask is None:
+            return False
+        nx, ny = self.impassable_mask.shape
+        ix = int(np.clip((x - self.hm_x_min) / self.hm_cell, 0, nx - 1))
+        iy = int(np.clip((y - self.hm_y_min) / self.hm_cell, 0, ny - 1))
+        return bool(self.impassable_mask[ix, iy])
 
     def _terrain_z(self, x, y):
         """Return local terrain height at world position (x, y), or None if unavailable."""
@@ -65,6 +78,10 @@ class BasicAStar(AStar):
                     if y2 < self.bounds[1][0] or y2 >= self.bounds[1][1]:
                         continue
 
+                    # Deep water (or any masked cell) is a no-go: route around it.
+                    if self._is_impassable(x2, y2):
+                        continue
+
                     tz = self._terrain_z(x2, y2)
                     if tz is None:
                         continue
@@ -96,6 +113,8 @@ class BasicAStar(AStar):
                             continue
                         if z2 < self.bounds[2][0] or z2 >= self.bounds[2][1]:
                             continue
+                        if self._is_impassable(x2, y2):
+                            continue
 
                         if self.occ_map.check_if_included(
                                 o3d.utility.Vector3dVector(np.array([[x2, y2, z2]])))[0]:
@@ -123,7 +142,7 @@ class BasicAStar(AStar):
 
 def astar_path_spline_fit(start_point, end_point, means, voxel_size=0.25, num_control_points=20, z_range=None,
                            height_map=None, hm_x_min=0.0, hm_y_min=0.0, hm_cell=1.0,
-                           clearance=0.0, z_band=0.2):
+                           clearance=0.0, z_band=0.2, impassable_mask=None):
     min_x = min(means[:,0].min(), start_point[0], end_point[0])
     max_x = max(means[:,0].max(), start_point[0], end_point[0])
     min_y = min(means[:,1].min(), start_point[1], end_point[1])
@@ -156,6 +175,7 @@ def astar_path_spline_fit(start_point, end_point, means, voxel_size=0.25, num_co
         height_map=height_map, hm_x_min=hm_x_min,
         hm_y_min=hm_y_min, hm_cell=hm_cell,
         clearance=clearance, z_band=z_band,
+        impassable_mask=impassable_mask,
     )
 
     start = (start_point[0], start_point[1], start_point[2])

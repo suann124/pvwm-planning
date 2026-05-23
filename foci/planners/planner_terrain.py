@@ -17,7 +17,10 @@ from sklearn.preprocessing import normalize
 
 
 class TerrainPlanner():
-    def __init__(self, obstacle_positions, obstacle_covs, robot_cov, num_control_points, num_samples, obstacle_colors=None, z_range=None):
+    def __init__(self, obstacle_positions, obstacle_covs, robot_cov, num_control_points, num_samples,
+                 obstacle_colors=None, z_range=None,
+                 height_map=None, hm_x_min=0.0, hm_y_min=0.0, hm_cell=1.0,
+                 clearance=0.0, z_band=0.3):
 
         self.num_control_points = num_control_points
         self.num_samples = num_samples
@@ -47,18 +50,24 @@ class TerrainPlanner():
             covs_inv[i] = np.linalg.inv(covs_sum[i])
 
         self.solver, self.lbg, self.ubg, self.convolution_functor = create_solver(
-            num_control_points, 
-            obstacle_positions, 
-            covs_det, covs_inv, 
-            self.kinematics, 
+            num_control_points,
+            obstacle_positions,
+            covs_det, covs_inv,
+            self.kinematics,
             dim_control_points=3,
             num_body_parts=3,
             num_samples=num_samples,
-            z_range=z_range)
+            z_range=z_range,
+            height_map=height_map,
+            hm_x_min=hm_x_min,
+            hm_y_min=hm_y_min,
+            hm_cell=hm_cell,
+            clearance=clearance,
+            z_band=z_band)
 
     def plan(self, start_pos, end_pos,
              height_map=None, hm_x_min=0.0, hm_y_min=0.0, hm_cell=1.0,
-             clearance=0.0, z_band=0.2):
+             clearance=0.0, z_band=0.2, impassable_mask=None):
 
         init_guess = astar_path_spline_fit(
             start_pos, end_pos, self.obstacle_positions,
@@ -67,6 +76,7 @@ class TerrainPlanner():
             height_map=height_map, hm_x_min=hm_x_min,
             hm_y_min=hm_y_min, hm_cell=hm_cell,
             clearance=clearance, z_band=z_band,
+            impassable_mask=impassable_mask,
         )
 
         #reshape initial spline into spline control points and samples the resulting curve
@@ -77,7 +87,7 @@ class TerrainPlanner():
         for i in range(1, self.num_samples):
             astar_length += np.linalg.norm(spline[i,:3] - spline[i-1,:3]) #approximate the length of the spline
         
-        self.ubg[-1] = astar_length * 1.5 #set the upper bound of the spline length
+        self.ubg[-1] = astar_length * 1 #set the upper bound of the spline length
 
         #solve the optimization problem
         res = self.solver(x0 = init_guess, lbg = self.lbg, ubg = self.ubg, p = np.concatenate((start_pos, end_pos)))

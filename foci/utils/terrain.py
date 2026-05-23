@@ -88,6 +88,124 @@ def build_flood_obstacle_mask(flood_means, height_map, x_min, y_min, cell_size,
     return flood_mask
 
 
+def build_flood_navigation(height_map, flood_means, x_min, y_min, cell_size,
+                           wading_depth=0.0, depth_eps=0.02):
+    """Derive the navigable surface and impassable mask for a flooded scene.
+
+    Combines the dry-terrain height map with flood Gaussians so the robot rides
+    *on top of* shallow (wadeable) water and routes *around* deep water, instead
+    of navigating beneath the water surface.  Feed ``nav_surface`` to the planner
+    in place of the dry height map, and ``impassable`` to the A* search.
+
+    Args:
+        height_map:   (nx, ny) dry-terrain surface Z from build_height_map
+        flood_means:  (N, 3) flood Gaussian centres in the same scaled coords
+        x_min, y_min, cell_size: grid metadata from build_height_map
+        wading_depth: water depth (scaled units) the robot can wade through; a
+                      cell deeper than this is impassable. 0.0 => any standing
+                      water blocks.
+        depth_eps:    water shallower than this above terrain is treated as
+                      noise and ignored (cell stays dry).
+
+    Returns:
+        nav_surface:   (nx, ny) surface the robot navigates above — the water
+                       height where wadeable, terrain elsewhere. Always
+                       >= height_map, so a path at nav_surface + clearance can
+                       never sit under the water.
+        impassable:    (nx, ny) bool — True where water depth > wading_depth.
+        water_surface: (nx, ny) max flood Z per cell, NaN where no flood.
+    """
+    nx, ny = height_map.shape
+
+    # Max flood Z per cell = the water surface (mirrors build_height_map's
+    # per-cell max idiom). -inf sentinel so np.maximum.at works, then -> NaN.
+    water_surface = np.full((nx, ny), -np.inf)
+    xi = np.clip(((flood_means[:, 0] - x_min) / cell_size).astype(int), 0, nx - 1)
+    yi = np.clip(((flood_means[:, 1] - y_min) / cell_size).astype(int), 0, ny - 1)
+    np.maximum.at(water_surface, (xi, yi), flood_means[:, 2])
+    water_surface[np.isinf(water_surface)] = np.nan
+
+    depth = water_surface - height_map                 # NaN where dry
+    wet = ~np.isnan(water_surface) & (depth > depth_eps)
+    impassable = wet & (depth > wading_depth)
+    wadeable = wet & (depth <= wading_depth)
+
+    # Ride on the water where it is wadeable; stay on terrain otherwise.
+    nav_surface = height_map.astype(float).copy()
+    nav_surface[wadeable] = water_surface[wadeable]
+    return nav_surface, impassable, water_surface
+
+
+def build_flood_obstacles(impassable, water_surface, height_map,
+                          x_min, y_min, cell_size,
+                          layer_dz=None, sigma_xy_scale=0.75):
+    """Obstacle Gaussians that fill the water *column* over each impassable cell.
+
+    The planner's obstacle cost is a Gaussian-Gaussian convolution, which decays
+    sharply away from each obstacle centre. A single thin disk at the water
+    surface is therefore invisible to a trajectory passing lower in the column —
+    the optimiser slips underneath it. Stacking Gaussians from the terrain floor
+    up to the water surface gives the cost vertical extent, so a curve at *any*
+    height inside the water feels it and is pushed out laterally (in XY).
+
+    Args:
+        impassable:    (nx, ny) bool — deep-water cells (from build_flood_navigation)
+        water_surface: (nx, ny) water height per cell, NaN where dry
+        height_map:    (nx, ny) terrain floor
+        x_min, y_min, cell_size: grid metadata
+        layer_dz:      vertical spacing between stacked Gaussians (scaled units).
+                       Defaults to cell_size. Smaller => denser column.
+        sigma_xy_scale: lateral std-dev as a fraction of cell_size.
+
+    Returns:
+        means (M, 3), covs (M, 3, 3)  — diagonal covariances. Empty (0, 3) /
+        (0, 3, 3) when there are no impassable cells.
+    """
+    if layer_dz is None:
+        layer_dz = cell_size
+
+    sigma_xy = sigma_xy_scale * cell_size
+    means, covs = [], []
+
+    for ix, iy in np.argwhere(impassable):
+        floor = float(height_map[ix, iy])
+        top = float(water_surface[ix, iy])
+        depth = top - floor
+        if not np.isfinite(depth) or depth <= 0:
+            continue
+
+        # Number of stacked layers and their (slightly overlapping) Z extent.
+        n = max(1, int(round(depth / layer_dz)))
+        seg = depth / n
+        sigma_z = 0.75 * seg
+
+        x = x_min + (ix + 0.5) * cell_size
+        y = y_min + (iy + 0.5) * cell_size
+        for i in range(n):
+            z = floor + (i + 0.5) * seg
+            means.append([x, y, z])
+            covs.append(np.diag([sigma_xy ** 2, sigma_xy ** 2, sigma_z ** 2]))
+
+    if means:
+        return np.asarray(means, dtype=float), np.asarray(covs, dtype=float)
+    return np.zeros((0, 3), dtype=float), np.zeros((0, 3, 3), dtype=float)
+
+
+def build_pin_surface(height_map, water_surface):
+    """Surface to snap the final trajectory Z onto: the higher of terrain and
+    water wherever there is water, terrain elsewhere.
+
+    The NLP leaves Z loose and the pipeline snaps it to a surface afterwards.
+    Pinning to bare terrain puts the robot on the dry floor *beneath* standing
+    water; pinning to this ceiling guarantees the path rides on top of any water
+    it strays over and never sits below the surface.
+    """
+    pin = height_map.astype(float).copy()
+    wet = ~np.isnan(water_surface)
+    pin[wet] = np.maximum(height_map[wet], water_surface[wet])
+    return pin
+
+
 def query_height(height_map, x_min, y_min, cell_size, x, y, default=0.0):
     """Look up terrain height at position (x, y) using bilinear interpolation.
 
