@@ -31,12 +31,12 @@ FLOOD_PLY   = os.path.join(LOCAL, f'data/hillcountry_flood_{FLOOD_LEVEL}.ply')
 # ── 1. Terrain (identical pipeline to hillcounty_terrain.py) ─────────────────
 print("Loading terrain...")
 means, covs, colors, opacities = extract_splat_data(TERRAIN_PLY)
-means, covs, colors, opacities = filter_floaters(
-    means, covs, colors, opacities,
-    opacity_threshold=0.3,
-    density_radius=0.05,
-    min_neighbors=5,
-)
+# means, covs, colors, opacities = filter_floaters(
+#     means, covs, colors, opacities,
+#     opacity_threshold=0.3,
+#     density_radius=0.05,
+#     min_neighbors=5,
+# )
 
 ground_z = np.percentile(means[:, 2], 6)
 print(f"Ground z (pre-scale): {ground_z:.4f}")
@@ -65,15 +65,22 @@ print(f"Flat Gaussians: {flat_mask.sum()} / {len(means)}")
 height_map, hm_x_min, hm_y_min, hm_cell = build_height_map(means[flat_mask], cell_size=0.5)
 print(f"Height map: {height_map.shape}")
 
-# nav_z = terrain height at the start/end midpoint + small clearance.
-# Using a local query instead of the global median keeps the starting height
-# grounded to where the robot actually begins and ends.
-clearance = 0.05
+# Two separate height parameters:
+#   obs_threshold — a Gaussian this far above the local terrain surface is an
+#                   obstacle (trees, walls, flood).  Kept small so low vegetation
+#                   is included.
+#   clearance     — the robot's navigation height above terrain.  Must satisfy
+#                   clearance > obs_threshold + voxel_size + margin so the robot
+#                   flies above the top of the obstacle voxels and never starts
+#                   inside one.  (voxel_size = 0.25 → need clearance > ~0.6)
+obs_threshold = 0.3   # scaled units
+clearance     = 1   # scaled units (navigates ~50 cm above terrain, ~25 cm above tallest obs voxel top)
+
 start_z_terrain = query_height(height_map, hm_x_min, hm_y_min, hm_cell, start_xy[0], start_xy[1])
 end_z_terrain   = query_height(height_map, hm_x_min, hm_y_min, hm_cell, end_xy[0],   end_xy[1])
 nav_z = 0.5 * (start_z_terrain + end_z_terrain) + clearance
 print(f"Terrain Z  — start: {start_z_terrain:.3f}, end: {end_z_terrain:.3f}")
-print(f"nav_z: {nav_z:.3f}  (z_range will be set after flood is loaded)")
+print(f"obs_threshold: {obs_threshold}, clearance: {clearance}, nav_z: {nav_z:.3f}")
 
 # ── 2. Load flood data and build flood obstacle mask ─────────────────────────
 print(f"\nLoading flood PLY: {FLOOD_LEVEL}...")
@@ -131,16 +138,16 @@ print(f"Flood Gaussians kept as nav-obstacles: {len(flood_means_nav)}")
 
 # ── 3. Build obstacle mask ────────────────────────────────────────────────────
 
-# Terrain Gaussians: obstacle if above local ground + clearance
+# Terrain Gaussians: obstacle if above local ground + obs_threshold
 xi_all = np.clip(((means[:, 0] - hm_x_min) / hm_cell).astype(int), 0, height_map.shape[0] - 1)
 yi_all = np.clip(((means[:, 1] - hm_y_min) / hm_cell).astype(int), 0, height_map.shape[1] - 1)
 local_ground = height_map[xi_all, yi_all]
-obstacle_mask = means[:, 2] > local_ground + clearance
+obstacle_mask = means[:, 2] > local_ground + obs_threshold
 
 print(f"Terrain obstacles: {obstacle_mask.sum()}, flood nav-obstacles: {len(flood_means_nav)}")
 
 # Corridor crop
-corridor = 40
+corridor = 20
 x_lo = min(start_xy[0], end_xy[0]) - corridor
 x_hi = max(start_xy[0], end_xy[0]) + corridor
 y_lo = min(start_xy[1], end_xy[1]) - corridor
@@ -155,15 +162,9 @@ fl_in_corridor = (
     (flood_means_nav[:, 1] > y_lo) & (flood_means_nav[:, 1] < y_hi)
 )
 
-# z-range should just follow terrain variation for a ground robot
-xi_c = np.clip(((means[in_corridor, 0] - hm_x_min) / hm_cell).astype(int), 0, height_map.shape[0] - 1)
-yi_c = np.clip(((means[in_corridor, 1] - hm_y_min) / hm_cell).astype(int), 0, height_map.shape[1] - 1)
-corr_z = height_map[xi_c, yi_c]
-
-z_lo = float(np.nanmin(corr_z)) + clearance - 0.1
-z_hi = float(np.nanmax(corr_z)) + clearance + 0.2
-z_range = (z_lo, z_hi)
-print(f"z_range: ({z_lo:.3f}, {z_hi:.3f})")
+# No global z_range: A* follows terrain dynamically via the height_map band,
+# and the post-processing step snaps the path Z to terrain + clearance.
+z_range = None
 
 obstacle_means = np.vstack([
     means[obstacle_mask & in_corridor],
@@ -211,22 +212,32 @@ print(f"Saved flood_planning_{FLOOD_LEVEL}.png")
 plt.close()
 
 # ── 5. Plan ───────────────────────────────────────────────────────────────────
-robot_cov = np.eye(3) * 0.001
+robot_cov = np.eye(3) * 0.0001
 planner = TerrainPlanner(obstacle_means, obstacle_covs, robot_cov,
                          num_control_points=10, num_samples=50, z_range=z_range)
 
 start = [start_xy[0], start_xy[1], start_z_terrain + clearance, np.pi/2]
 end   = [end_xy[0],   end_xy[1],   end_z_terrain   + clearance, np.pi/2]
-opt_curve, astar = planner.plan(start, end)
+
+
+opt_curve, astar = planner.plan(
+    start, end,
+    height_map=height_map,
+    hm_x_min=hm_x_min,
+    hm_y_min=hm_y_min,
+    hm_cell=hm_cell,
+    clearance=clearance,
+    z_band=0.15,   # robot navigates within 15 cm band above local terrain
+)
 
 print(f"A* path points: {len(astar)}")
 
 for i in range(len(opt_curve)):
     x, y = opt_curve[i, 0], opt_curve[i, 1]
-    opt_curve[i, 2] = query_height(height_map, hm_x_min, hm_y_min, hm_cell, x, y) + 0.05
+    opt_curve[i, 2] = query_height(height_map, hm_x_min, hm_y_min, hm_cell, x, y) + clearance
 
 # ── 6. Visualise ──────────────────────────────────────────────────────────────
-margin = 10
+margin = 30
 x_min_v, y_min_v = astar[:, :2].min(axis=0) - margin
 x_max_v, y_max_v = astar[:, :2].max(axis=0) + margin
 crop_mask = (

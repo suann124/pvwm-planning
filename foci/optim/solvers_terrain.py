@@ -69,8 +69,8 @@ def create_solver(num_control_points,
 
     # Weighing factor for cost
     w_0 = 0.1 # jerk cost
-    w_1 = 40 # obstacle cost
-    w_2 = 40 # goal cost
+    w_1 = 100 # obstacle cost
+    w_2 = 100 # goal cost
     w_head = 1
     
     # define helpful mappings

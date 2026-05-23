@@ -56,9 +56,18 @@ class TerrainPlanner():
             num_samples=num_samples,
             z_range=z_range)
 
-    def plan(self,start_pos, end_pos):
+    def plan(self, start_pos, end_pos,
+             height_map=None, hm_x_min=0.0, hm_y_min=0.0, hm_cell=1.0,
+             clearance=0.0, z_band=0.2):
 
-        init_guess = astar_path_spline_fit(start_pos, end_pos, self.obstacle_positions, num_control_points=self.num_control_points, voxel_size=0.25, z_range=self.z_range)
+        init_guess = astar_path_spline_fit(
+            start_pos, end_pos, self.obstacle_positions,
+            num_control_points=self.num_control_points,
+            voxel_size=0.25, z_range=self.z_range,
+            height_map=height_map, hm_x_min=hm_x_min,
+            hm_y_min=hm_y_min, hm_cell=hm_cell,
+            clearance=clearance, z_band=z_band,
+        )
 
         #reshape initial spline into spline control points and samples the resulting curve
         #each control point consists of (x,y,z,theta)
